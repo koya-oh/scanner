@@ -46,6 +46,8 @@
   .last.ok{background:#e7f6ee;color:#14532d}
   .last.ok b{font-size:17px}
   .scanbar{display:flex;gap:8px;margin-top:10px}
+  .zoom{display:flex;align-items:center;gap:10px;margin-top:10px}
+  .zoom input{flex:1;padding:0;border:0;accent-color:var(--accent)}
   .scanbar button{flex:1}
   .last{margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--bg);font-size:14px;min-height:42px;display:flex;align-items:center;gap:8px}
   .last b{font-family:ui-monospace,Menlo,monospace;font-size:15px}
@@ -103,6 +105,7 @@
   <!-- 스캔 -->
   <section class="card" id="tab-scan">
     <div id="reader"><video id="vid" playsinline muted></video><div class="guide"></div><div class="off" id="camOff">카메라가 꺼져 있어요</div><div class="hit" id="hit"><div class="ok">✓ 인식됨</div><div class="c" id="hitCode"></div><div class="t" id="hitTotal"></div></div></div>
+    <div class="zoom hidden" id="zoomBox"><span class="hint">확대</span><input type="range" id="zoom" min="1" max="1" step="0.1" value="1"><span class="hint" id="zoomVal">1.0x</span></div>
     <div class="scanbar">
       <button class="primary" id="btnScan">카메라 켜기</button>
     </div>
@@ -119,7 +122,7 @@
       <div class="stepper" data-for="codeQty"><button data-d="-1">−</button><span id="codeQty">1</span><button data-d="1">+</button></div>
       <button class="primary" id="btnAddCode" style="flex:1">추가</button>
     </div>
-    <p class="hint" style="margin-top:8px">바코드가 안 읽히거나 없는 스티커는 번호를 직접 입력하세요.</p>
+    <p class="hint" style="margin-top:8px">바코드가 안 읽히거나 없는 스티커는 번호를 직접 입력하세요. 블루투스 바코드 리더기를 연결했다면 이 칸을 누른 상태에서 스캔하면 바로 추가돼요.</p>
   </section>
 
   <!-- 메모 -->
@@ -390,10 +393,19 @@
     }
     return zxReady;
   }
-  async function decode(src){
-    const res = await ZXingWASM.readBarcodes(src, { formats: FORMATS, tryHarder: true, tryRotate: true, tryInvert: false, maxNumberOfSymbols: 1 });
+  async function decode(src, opts){
+    const res = await ZXingWASM.readBarcodes(src, Object.assign({ formats: FORMATS, tryHarder: true, tryRotate: true, tryInvert: false, maxNumberOfSymbols: 1 }, opts || {}));
     const r = res.find(x => x.isValid && x.text);
     return r ? { text: r.text, format: r.format } : null;
+  }
+
+  // 판독 결과 확정: 느슨한 판독(보정 이미지)은 같은 값이 두 번 나와야 등록 (오인식 방지)
+  let pend = { text: '', at: 0 };
+  function candidate(text, fmt, strict){
+    if (strict || (isC39(fmt) && c39HasCheck(text))) { onScan(text, fmt); return; }
+    const now = Date.now();
+    if (pend.text === text && now - pend.at < 1500) { pend = { text: '', at: 0 }; onScan(text, fmt); }
+    else pend = { text, at: now };
   }
 
   function onScan(text, fmt){
@@ -453,33 +465,77 @@
     $('chKeep').onclick = () => done('keep');
   }
 
+  // 프레임마다 처리 방식을 번갈아 적용 (학교 스티커처럼 로고가 겹친 바코드 대응)
+  //  0: 전체 화면 원본   1: 가운데 고해상도 + 로고 제거·검정 강조   2: 가운데 고해상도 원본   3: 전체 화면 + 로고 제거·검정 강조
+  let fi = 0, detector = null;
+  function enhance(img){
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      // 파란 로고는 가장 밝은 채널이 높아서 흰색에 가까워지고, 검정 막대만 어둡게 남음
+      let m = d[i] > d[i+1] ? d[i] : d[i+1]; if (d[i+2] > m) m = d[i+2];
+      m = (m * m) / 255; // 감마 2: 검정 대비 강화
+      d[i] = d[i+1] = d[i+2] = m;
+    }
+    return img;
+  }
+  function grab(v, center){
+    const vw = v.videoWidth, vh = v.videoHeight;
+    let sx = 0, sy = 0, sw = vw, sh = vh;
+    if (center) { sw = Math.round(vw * 0.7); sh = Math.round(vh * 0.5); sx = Math.round((vw - sw) / 2); sy = Math.round((vh - sh) / 2); }
+    const scale = center ? 1 : Math.min(1, 1920 / Math.max(vw, vh));
+    cv.width = Math.round(sw * scale); cv.height = Math.round(sh * scale);
+    cx.drawImage(v, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+    return cx.getImageData(0, 0, cv.width, cv.height);
+  }
   async function tick(){
     if (!scanning) return;
     const v = $('vid');
     if (!busy && !paused && v.readyState >= 2 && v.videoWidth) {
       busy = true;
       try {
-        // 프레임 전체를 읽음 (바코드 양끝이 잘리지 않도록). 너무 크면 1920px로 줄임
-        const vw = v.videoWidth, vh = v.videoHeight;
-        const scale = Math.min(1, 1920 / Math.max(vw, vh));
-        cv.width = Math.round(vw * scale); cv.height = Math.round(vh * scale);
-        cx.drawImage(v, 0, 0, cv.width, cv.height);
-        const r = await decode(cx.getImageData(0, 0, cv.width, cv.height));
-        if (r) onScan(r.text, r.format);
+        const mode = fi++ % 4;
+        // 안드로이드 크롬: 기기 내장 인식기(구글 ML Kit)도 함께 사용
+        if (detector && mode % 2 === 0) {
+          try { const b = await detector.detect(v); if (b && b[0] && b[0].rawValue) candidate(b[0].rawValue, b[0].format, true); } catch(e) {}
+        }
+        let r = null;
+        if (mode === 0) r = await decode(grab(v, false));
+        else if (mode === 1) r = await decode(enhance(grab(v, true)), { minLineCount: 1, binarizer: 'GlobalHistogram' });
+        else if (mode === 2) r = await decode(grab(v, true), { minLineCount: 1 });
+        else r = await decode(enhance(grab(v, false)), { minLineCount: 1 });
+        if (r) candidate(r.text, r.format, mode === 0);
       } catch(e) {}
       busy = false;
     }
-    timer = setTimeout(tick, 80);
+    timer = setTimeout(tick, 40);
   }
   async function startScan(){
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('이 브라우저에서는 카메라를 쓸 수 없어요. https 주소로 열었는지 확인해 주세요.'); return; }
     $('btnScan').disabled = true;
     try {
       await ensureZX();
-      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } } });
       const v = $('vid'); v.srcObject = stream; await v.play();
       const track = stream.getVideoTracks()[0];
       try { const c = track.getCapabilities ? track.getCapabilities() : {}; if (c.focusMode && c.focusMode.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch(e) {}
+      // 확대: 지원하는 기기에서만 표시. 너무 가까이 대면 초점이 안 맞으니 조금 떨어져서 확대
+      try {
+        const c = track.getCapabilities ? track.getCapabilities() : {};
+        if (c.zoom && c.zoom.max > c.zoom.min) {
+          const z = $('zoom'); z.min = c.zoom.min; z.max = Math.min(c.zoom.max, 8); z.step = c.zoom.step || 0.1;
+          const cur = (track.getSettings().zoom) || c.zoom.min; z.value = cur; $('zoomVal').textContent = (+cur).toFixed(1) + 'x';
+          z.oninput = () => { $('zoomVal').textContent = (+z.value).toFixed(1) + 'x'; track.applyConstraints({ advanced: [{ zoom: +z.value }] }).catch(() => {}); };
+          $('zoomBox').classList.remove('hidden');
+        }
+      } catch(e) {}
+      try {
+        if (!detector && 'BarcodeDetector' in window) {
+          const want = ['code_39','code_93','code_128','codabar','itf','ean_13','ean_8','upc_a','upc_e','qr_code','data_matrix','pdf417','aztec'];
+          const sup = await BarcodeDetector.getSupportedFormats();
+          const f = want.filter(x => sup.includes(x));
+          if (f.length) detector = new BarcodeDetector({ formats: f });
+        }
+      } catch(e) { detector = null; }
       scanning = true; $('camOff').classList.add('hidden'); $('btnScan').textContent = '카메라 끄기';
       tick();
     } catch (e) {
@@ -491,7 +547,7 @@
   function stopScan(){
     scanning = false; clearTimeout(timer);
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-    $('vid').srcObject = null; $('camOff').classList.remove('hidden'); $('btnScan').textContent = '카메라 켜기';
+    $('vid').srcObject = null; $('camOff').classList.remove('hidden'); $('zoomBox').classList.add('hidden'); $('btnScan').textContent = '카메라 켜기';
   }
   $('btnScan').addEventListener('click', () => { unlockAudio(); scanning ? stopScan() : startScan(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) stopScan(); });
