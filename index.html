@@ -37,7 +37,14 @@
   #reader video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
   #reader .guide{position:absolute;left:5%;right:5%;top:25%;bottom:25%;border:2px solid rgba(255,255,255,.9);border-radius:10px;box-shadow:0 0 0 999px rgba(0,0,0,.35);pointer-events:none}
   #reader .off{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#cfd3da;font-size:14px}
-  #reader.flash .guide{border-color:#7ee2a8;box-shadow:0 0 0 999px rgba(0,0,0,.35),0 0 0 3px #7ee2a8 inset}
+  #reader.flash .guide{border-color:#2ecc71;border-width:4px;box-shadow:0 0 0 999px rgba(20,120,60,.45)}
+  #reader .hit{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(.9);background:#1f9d55;color:#fff;border-radius:16px;padding:14px 20px;text-align:center;opacity:0;transition:opacity .15s,transform .15s;pointer-events:none;min-width:70%}
+  #reader .hit .ok{font-size:20px;font-weight:800}
+  #reader .hit .c{font-family:ui-monospace,Menlo,monospace;font-size:22px;font-weight:700;margin-top:4px;word-break:break-all}
+  #reader .hit .t{font-size:14px;opacity:.9;margin-top:2px}
+  #reader.flash .hit{opacity:1;transform:translate(-50%,-50%) scale(1)}
+  .last.ok{background:#e7f6ee;color:#14532d}
+  .last.ok b{font-size:17px}
   .scanbar{display:flex;gap:8px;margin-top:10px}
   .scanbar button{flex:1}
   .last{margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--bg);font-size:14px;min-height:42px;display:flex;align-items:center;gap:8px}
@@ -95,7 +102,7 @@
 
   <!-- 스캔 -->
   <section class="card" id="tab-scan">
-    <div id="reader"><video id="vid" playsinline muted></video><div class="guide"></div><div class="off" id="camOff">카메라가 꺼져 있어요</div></div>
+    <div id="reader"><video id="vid" playsinline muted></video><div class="guide"></div><div class="off" id="camOff">카메라가 꺼져 있어요</div><div class="hit" id="hit"><div class="ok">✓ 인식됨</div><div class="c" id="hitCode"></div><div class="t" id="hitTotal"></div></div></div>
     <div class="scanbar">
       <button class="primary" id="btnScan">카메라 켜기</button>
     </div>
@@ -170,6 +177,13 @@
     </div>
     <div class="srow">
       <div>
+        <div>인식 소리</div>
+        <div class="hint" id="setSoundTxt"></div>
+      </div>
+      <button id="btnSoundToggle">바꾸기</button>
+    </div>
+    <div class="srow">
+      <div>
         <div>기록 전체 지우기</div>
         <div class="hint">모든 위치의 기록이 삭제돼요.</div>
       </div>
@@ -203,7 +217,7 @@
   // codes: [{loc, raw, fmt, n}]  raw = 스캔/입력 원본 값
   // memos: [{loc, memo, n}]
   // check39: null(미정) | 'strip' | 'keep'
-  let state = { loc:'', codes:[], memos:[], check39:null };
+  let state = { loc:'', codes:[], memos:[], check39:null, sound:true };
   try { const s = JSON.parse(localStorage.getItem(KEY) || 'null'); if (s) state = Object.assign(state, s); } catch(e) {}
   function save(){ try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e) {} }
 
@@ -289,6 +303,7 @@
     $('memoList').innerHTML = h || '<div class="empty">아직 없어요.</div>';
     const mTotal = state.memos.reduce((a, r) => a + r.n, 0);
     $('memoSum').textContent = state.memos.length ? `${state.memos.length}종 · ${mTotal}개` : '';
+    $('setSoundTxt').textContent = state.sound === false ? '끔' : '켬';
     $('setCheckTxt').textContent = state.check39 === 'strip' ? '끝 글자 빼기' : state.check39 === 'keep' ? '그대로 두기' : '아직 정하지 않음 (처음 스캔할 때 물어봐요)';
   }
 
@@ -388,11 +403,39 @@
     if (isC39(fmt) && state.check39 === null && c39HasCheck(text)) { askCheck(text, fmt); return; }
     commitScan(text, fmt);
   }
+  // ---------- 인식 알림 (소리·진동·화면) ----------
+  let actx = null, hitT = null;
+  function unlockAudio(){
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') actx.resume();
+      // iOS: 사용자 터치 순간에 무음 한 번 재생해 두어야 이후 소리가 남
+      const b = actx.createBuffer(1, 1, 22050), src = actx.createBufferSource(); src.buffer = b; src.connect(actx.destination); src.start(0);
+    } catch(e) {}
+  }
+  function beep(){
+    if (state.sound === false || !actx) return;
+    try {
+      const t = actx.currentTime;
+      [[1320, 0], [1760, 0.09]].forEach(([f, d]) => {
+        const o = actx.createOscillator(), g = actx.createGain();
+        o.type = 'sine'; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t + d);
+        g.gain.exponentialRampToValueAtTime(0.35, t + d + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.08);
+        o.connect(g); g.connect(actx.destination); o.start(t + d); o.stop(t + d + 0.1);
+      });
+    } catch(e) {}
+  }
   function commitScan(text, fmt){
     const r = addCode(text, fmt, 1);
-    if (navigator.vibrate) { try { navigator.vibrate(60); } catch(e) {} }
-    const rd = $('reader'); rd.classList.add('flash'); setTimeout(() => rd.classList.remove('flash'), 350);
-    $('lastScan').innerHTML = `<span>등록</span><b>${esc(r.code)}</b><span class="hint">합계 ${r.total}개</span>`;
+    beep();
+    if (navigator.vibrate) { try { navigator.vibrate(120); } catch(e) {} }
+    $('hitCode').textContent = r.code;
+    $('hitTotal').textContent = r.total > 1 ? `합계 ${r.total}개` : '새로 등록';
+    const rd = $('reader'); rd.classList.add('flash'); clearTimeout(hitT); hitT = setTimeout(() => rd.classList.remove('flash'), 1100);
+    const last = $('lastScan'); last.classList.add('ok');
+    last.innerHTML = `<span>✓ 등록</span><b>${esc(r.code)}</b><span class="hint">합계 ${r.total}개</span>`;
   }
   function askCheck(text, fmt){
     paused = true;
@@ -449,7 +492,7 @@
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     $('vid').srcObject = null; $('camOff').classList.remove('hidden'); $('btnScan').textContent = '카메라 켜기';
   }
-  $('btnScan').addEventListener('click', () => scanning ? stopScan() : startScan());
+  $('btnScan').addEventListener('click', () => { unlockAudio(); scanning ? stopScan() : startScan(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) stopScan(); });
 
   // ---------- 내보내기 ----------
@@ -494,10 +537,13 @@
     save(); render();
     toast(state.check39 === 'strip' ? '끝 글자를 빼도록 바꿨어요.' : '그대로 두도록 바꿨어요.');
   });
+  $('btnSoundToggle').addEventListener('click', () => {
+    state.sound = state.sound === false; save(); render(); unlockAudio(); if (state.sound) beep();
+  });
   $('btnReset').addEventListener('click', () => {
     $('mSettings').classList.remove('show');
     confirmBox('기록을 모두 지울까요?', '모든 위치의 기록과 검증 글자 설정이 삭제돼요. 되돌릴 수 없어요.', () => {
-      state = { loc: state.loc, codes: [], memos: [], check39: null }; save(); render(); toast('모두 지웠어요.');
+      state = { loc: state.loc, codes: [], memos: [], check39: null, sound: state.sound }; save(); render(); toast('모두 지웠어요.');
     });
   });
 
@@ -511,7 +557,7 @@
   }
 
   // 테스트용 노출
-  window.__jaemul = { addCode, addMemo, c39HasCheck, onScan, decode, ensureZX, state: () => state, rows };
+  window.__jaemul = { commitScan, addCode, addMemo, c39HasCheck, onScan, decode, ensureZX, state: () => state, rows };
 
   render();
 })();
